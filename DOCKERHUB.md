@@ -73,6 +73,7 @@ These environment variables are optional, and could be used to adjust functional
 | STALL_TIMEOUT | number | 900 | The number of seconds without lftp progress before a sync is considered stalled and killed. Also used by the container's `HEALTHCHECK` to decide how stale the heartbeat is allowed to get before reporting unhealthy |
 | WEB_PORT | number | 8080 | Port for the [status API](#status-api) (`/status`, `/events`) |
 | HISTORY_FILE | string | /var/log/lftp-mirror/history.jsonl | Path to the JSON-lines download/remove history log read by `/events` |
+| DISABLE_WEB_API | boolean | false | Set to `true` to disable the [status API](#status-api) entirely, rather than just leaving `WEB_PORT` unpublished |
 
 ## Healthcheck
 The image defines a Docker `HEALTHCHECK` that runs every 60 seconds. A heartbeat file is touched at the start of each sync cycle and on every line of `lftp` output; a watchdog thread kills the `lftp` process if no output is seen for `STALL_TIMEOUT` seconds, so a dead SFTP connection can't hang forever. The healthcheck reports unhealthy if the heartbeat file is missing or older than `UPDATE_INTERVAL + STALL_TIMEOUT` (plus a small grace period), which lets orchestrators (e.g. Docker Compose `restart: unless-stopped`, Kubernetes liveness probes) detect and restart a hung container.
