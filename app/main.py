@@ -30,6 +30,10 @@ HEARTBEAT_FILE = os.environ.get('HEARTBEAT_FILE', '/tmp/heartbeat')
 # and killing it, rather than hanging forever on a dead connection.
 STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '900'))
 
+# Set to disable the /status and /events HTTP API entirely, rather than
+# just leaving its port unpublished.
+DISABLE_WEB_API = os.environ.get('DISABLE_WEB_API', 'false').lower() in ('1', 'true', 'yes', 'on')
+
 # Validate that all required environment variables are set
 required_vars = {
     "SSH_USERNAME": SSH_USERNAME,
@@ -226,7 +230,8 @@ def main():
 
     # Serve /status and /events for external consumers (e.g. a Home
     # Assistant RESTful sensor) over HTTP.
-    web.start_server()
+    if not DISABLE_WEB_API:
+        web.start_server()
 
     # Acquire the host key
     logging.info(f"🔑 Acquiring host key from {SOURCE_HOSTNAME}...")
