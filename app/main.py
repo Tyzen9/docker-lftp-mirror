@@ -26,9 +26,16 @@ UPDATE_INTERVAL = int(os.environ.get('UPDATE_INTERVAL', '300'))
 # start of every cycle and on every line of lftp output, so a stalled SFTP
 # connection (no output, no progress) shows up as a stale heartbeat.
 HEARTBEAT_FILE = os.environ.get('HEARTBEAT_FILE', '/tmp/heartbeat')
-# How long to wait with no lftp output before treating the transfer as stalled
-# and killing it, rather than hanging forever on a dead connection.
+# How long to wait with no lftp progress (no output and no growth of any
+# in-flight temp file) before treating the transfer as stalled and killing it,
+# rather than hanging forever on a dead connection.
 STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '900'))
+
+# Must match xfer:temp-file-name in lftp.conf ("*.lftp"). lftp writes each
+# file under this suffix and renames it once complete.
+LFTP_TEMP_SUFFIX = ".lftp"
+# How often (seconds) to check in-flight files for growth/completion.
+ACTIVE_POLL_INTERVAL = 5
 
 # Set to disable the /status and /events HTTP API entirely, rather than
 # just leaving its port unpublished.
@@ -149,16 +156,38 @@ def touch_heartbeat():
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def run_lftp(command):
     """Run lftp and stream output in real time, logging file transfer events.
-    A watchdog thread kills the lftp process if no output is seen for
-    STALL_TIMEOUT seconds — otherwise a dropped/stalled SFTP connection can
-    leave process.wait() blocked forever with no way to recover.
+
+    With --parallel, lftp prints "Transferring file" when each file STARTS and
+    nothing when it finishes. Completion is detected on disk instead: lftp.conf
+    sets xfer:use-temp-file, so a file is written as "<name>.lftp" and renamed
+    to "<name>" only once complete. A poller thread watches every active file;
+    the rename marks it downloaded, and temp-file growth counts as progress.
+
+    A watchdog thread kills lftp if there's been no progress (no output and no
+    temp-file growth) for STALL_TIMEOUT seconds — otherwise a dropped/stalled
+    SFTP connection can leave process.wait() blocked forever.
+
+    Any file still active when lftp exits successfully is recorded as
+    downloaded then; on failure/stall-kill they're dropped, and the next
+    cycle's --continue resumes them (re-recording them as started).
     """
-    current_file = None
+    active = {}  # path -> {"started", "temp_seen", "size"}; insertion-ordered
+    active_lock = threading.Lock()
     downloaded = 0
     removed = 0
 
+    def mark_downloaded(path):
+        nonlocal downloaded
+        with active_lock:
+            if active.pop(path, None) is None:
+                return
+            downloaded += 1
+        logging.info(f"    ☑️  Completed: {path}")
+        web.record_event("download", path)
+        web.remove_active(path)
+
     def drain_stdout(pipe):
-        nonlocal current_file, downloaded, removed
+        nonlocal removed
         for line in pipe:
             touch_heartbeat()
             line = line.rstrip()
@@ -168,12 +197,14 @@ def run_lftp(command):
             remove_match = re.match(r"Removing old (?:file|directory) `(.+)'", line)
             mkdir_match = re.match(r"mkdir `(.+)'", line)
             if transfer_match:
-                if current_file:
-                    downloaded += 1
-                    logging.info(f"    ☑️  Completed: {current_file}")
-                    web.record_event("download", current_file)
-                current_file = transfer_match.group(1)
-                logging.info(f"  🟢 Downloading: {current_file}")
+                path = transfer_match.group(1)
+                with active_lock:
+                    if path in active:
+                        continue
+                    active[path] = {"started": time.time(), "temp_seen": False, "size": -1}
+                logging.info(f"  🟢 Downloading: {path}")
+                web.record_event("start", path)
+                web.add_active(path)
             elif remove_match:
                 removed += 1
                 logging.info(f"  🗑️  Removing:   {remove_match.group(1)}")
@@ -182,10 +213,6 @@ def run_lftp(command):
                 logging.info(f"  📁 mkdir:      {mkdir_match.group(1)}")
             else:
                 logging.debug(f"lftp: {line}")
-        if current_file:
-            downloaded += 1
-            logging.info(f"    ☑️  Completed: {current_file}")
-            web.record_event("download", current_file)
 
     def drain_stderr(pipe):
         for line in pipe:
@@ -193,6 +220,49 @@ def run_lftp(command):
             line = line.rstrip()
             if line:
                 logging.warning(f"lftp: {line}")
+
+    def check_active():
+        """One pass over active files: record growth, detect completion."""
+        with active_lock:
+            snapshot = [(p, dict(info)) for p, info in active.items()]
+        for path, info in snapshot:
+            final = os.path.join(TARGET_DIR, path)
+            try:
+                tmp = os.stat(final + LFTP_TEMP_SUFFIX)
+            except OSError:
+                tmp = None
+            if tmp is not None:
+                with active_lock:
+                    if path in active:
+                        active[path]["temp_seen"] = True
+                        active[path]["size"] = tmp.st_size
+                if tmp.st_size != info["size"]:
+                    touch_heartbeat()  # bytes are landing: not stalled
+                    web.set_active_bytes(path, tmp.st_size)
+                continue
+            try:
+                st = os.stat(final)
+            except OSError:
+                continue  # transfer not underway on disk yet
+            if info["temp_seen"]:
+                mark_downloaded(path)  # temp file was renamed into place
+            elif st.st_ctime >= info["started"] - 2:
+                # Finished between polls without us seeing the temp file.
+                # ctime (set by the rename) proves it's this cycle's copy and
+                # not an older version; wait for a stable size to be safe.
+                if st.st_size == info["size"]:
+                    mark_downloaded(path)
+                else:
+                    with active_lock:
+                        if path in active:
+                            active[path]["size"] = st.st_size
+
+    def poll_active(stop_event):
+        while not stop_event.wait(ACTIVE_POLL_INTERVAL):
+            try:
+                check_active()
+            except Exception as e:
+                logging.debug(f"Active-transfer poll failed: {e}")
 
     def watch_for_stall(process, stop_event):
         while not stop_event.wait(15):
@@ -203,22 +273,37 @@ def run_lftp(command):
                 return
 
     touch_heartbeat()
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, shell=True, bufsize=1
-    )
-    stop_event = threading.Event()
-    t_out = threading.Thread(target=drain_stdout, args=(process.stdout,))
-    t_err = threading.Thread(target=drain_stderr, args=(process.stderr,))
-    t_watch = threading.Thread(target=watch_for_stall, args=(process, stop_event))
-    t_out.start()
-    t_err.start()
-    t_watch.start()
-    process.wait()
-    stop_event.set()
-    t_out.join()
-    t_err.join()
-    t_watch.join()
+    web.clear_active()
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, shell=True, bufsize=1
+        )
+        stop_event = threading.Event()
+        threads = [
+            threading.Thread(target=drain_stdout, args=(process.stdout,)),
+            threading.Thread(target=drain_stderr, args=(process.stderr,)),
+            threading.Thread(target=poll_active, args=(stop_event,)),
+            threading.Thread(target=watch_for_stall, args=(process, stop_event)),
+        ]
+        for t in threads:
+            t.start()
+        process.wait()
+        stop_event.set()
+        for t in threads:
+            t.join()
+
+        if process.returncode == 0:
+            # Catch anything the poller hadn't confirmed yet (e.g. finished
+            # in the last poll interval, or temp files disabled).
+            for path in list(active):
+                mark_downloaded(path)
+        elif active:
+            logging.warning(f"{len(active)} in-flight transfer(s) not completed; will resume next cycle")
+    finally:
+        # Never leave stale entries in /status "active", whether lftp
+        # succeeded, failed, was stall-killed, or run_lftp itself raised.
+        web.clear_active()
     return process.returncode, downloaded, removed
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -227,6 +312,9 @@ def main():
     # Seed the heartbeat immediately so healthcheck.py has something to read
     # before the first cycle completes.
     touch_heartbeat()
+
+    # Record start/download/remove history even when the API is disabled.
+    web.init_history_logger()
 
     # Serve /status and /events for external consumers (e.g. a Home
     # Assistant RESTful sensor) over HTTP.

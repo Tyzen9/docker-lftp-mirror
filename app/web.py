@@ -2,8 +2,8 @@
 consumers (e.g. a Home Assistant RESTful sensor) without adding a dependency.
 
 Endpoints:
-  GET /status - current cycle summary (JSON)
-  GET /events - recent download/remove history, newest first (JSON)
+  GET /status - current cycle summary plus in-flight transfers (JSON)
+  GET /events - recent start/download/remove history, newest first (JSON)
 """
 import json
 import logging
@@ -40,7 +40,8 @@ _state = {
     "downloaded": 0,
     "removed": 0,
     "next_sync": None,
-    "totals": {"download": 0, "remove": 0},
+    "active": [],
+    "totals": {"start": 0, "download": 0, "remove": 0},
 }
 
 _history_logger = logging.getLogger("lftp_mirror.history")
@@ -48,7 +49,12 @@ _history_logger.setLevel(logging.INFO)
 _history_logger.propagate = False
 
 
-def _init_history_logger():
+def init_history_logger():
+    """Attach the rotating history file handler. Safe to call more than once,
+    and called independently of the web server so history is still recorded
+    when DISABLE_WEB_API is set."""
+    if _history_logger.handlers:
+        return
     os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
         HISTORY_FILE, maxBytes=HISTORY_MAX_BYTES, backupCount=HISTORY_BACKUP_COUNT
@@ -62,18 +68,53 @@ def update_state(**kwargs):
         _state.update(kwargs)
 
 
+def _subfolder(path):
+    return path.split("/", 1)[0] if "/" in path else ""
+
+
+def add_active(path):
+    """Mark a file as in-flight so /status can show it under "active"."""
+    with _lock:
+        if any(a["path"] == path for a in _state["active"]):
+            return
+        _state["active"].append({
+            "path": path,
+            "subfolder": _subfolder(path),
+            "started": datetime.now(TZ).isoformat(timespec="seconds"),
+            "bytes": 0,
+        })
+
+
+def set_active_bytes(path, nbytes):
+    """Update how many bytes of an in-flight file have landed locally."""
+    with _lock:
+        for a in _state["active"]:
+            if a["path"] == path:
+                a["bytes"] = nbytes
+                return
+
+
+def remove_active(path):
+    with _lock:
+        _state["active"] = [a for a in _state["active"] if a["path"] != path]
+
+
+def clear_active():
+    with _lock:
+        _state["active"] = []
+
+
 def get_state():
     with _lock:
         return json.loads(json.dumps(_state))
 
 
 def record_event(event, path):
-    """Append a download/remove event to the history log and bump its total."""
-    subfolder = path.split("/", 1)[0] if "/" in path else ""
+    """Append a start/download/remove event to the history log and bump its total."""
     entry = {
         "time": datetime.now(TZ).isoformat(timespec="seconds"),
         "event": event,
-        "subfolder": subfolder,
+        "subfolder": _subfolder(path),
         "path": path,
     }
     _history_logger.info(json.dumps(entry))
@@ -129,7 +170,6 @@ class _Handler(BaseHTTPRequestHandler):
 
 def start_server():
     """Start the web server on a daemon thread and return it."""
-    _init_history_logger()
     server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
