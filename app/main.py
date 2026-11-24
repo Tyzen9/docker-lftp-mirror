@@ -34,6 +34,10 @@ STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '900'))
 # Must match xfer:temp-file-name in lftp.conf ("*.lftp"). lftp writes each
 # file under this suffix and renames it once complete.
 LFTP_TEMP_SUFFIX = ".lftp"
+# pget (--use-pget-n) also keeps a "<name>.lftp.lftp-pget-status" file beside
+# the temp file. Both are excluded from the mirror so --delete never removes a
+# partial download, and they're never reported as remove events.
+LFTP_TEMP_GLOBS = ("*.lftp", "*.lftp-pget-status")
 # How often (seconds) to check in-flight files for growth/completion.
 ACTIVE_POLL_INTERVAL = 5
 
@@ -154,7 +158,28 @@ def touch_heartbeat():
         logging.debug(f"Failed to touch heartbeat file: {e}")
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-def run_lftp(command):
+def is_lftp_temp(path):
+    return path.endswith(LFTP_TEMP_SUFFIX) or path.endswith(".lftp-pget-status")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def remove_orphan_temp_files():
+    """Delete lftp temp files left behind by transfers that will never finish
+    (e.g. the source file was removed mid-copy). Only called after lftp exits
+    cleanly, when nothing is in flight and every surviving source file has been
+    fully mirrored, so any temp file still on disk is an orphan."""
+    for root, _dirs, files in os.walk(TARGET_DIR):
+        for name in files:
+            if not is_lftp_temp(name):
+                continue
+            full = os.path.join(root, name)
+            try:
+                os.remove(full)
+                logging.info(f"  🧹 Removed stale lftp temp file: {os.path.relpath(full, TARGET_DIR)}")
+            except OSError as e:
+                logging.warning(f"Failed to remove stale lftp temp file {full}: {e}")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def run_lftp(command, pending):
     """Run lftp and stream output in real time, logging file transfer events.
 
     With --parallel, lftp prints "Transferring file" when each file STARTS and
@@ -167,12 +192,22 @@ def run_lftp(command):
     temp-file growth) for STALL_TIMEOUT seconds — otherwise a dropped/stalled
     SFTP connection can leave process.wait() blocked forever.
 
-    Any file still active when lftp exits successfully is recorded as
-    downloaded then; on failure/stall-kill they're dropped, and the next
-    cycle's --continue resumes them (re-recording them as started).
+    `pending` (path -> {"started", "temp_seen", "size", "this_cycle"}) holds
+    files that have started but aren't confirmed complete, and is kept across
+    cycles. If a cycle fails or is stall-killed mid-transfer, its entries carry
+    over: a file whose rename landed just before lftp exited, or that finishes
+    in a later cycle, still gets exactly one download event, and the next
+    cycle's resumed transfer is flagged "resumed" instead of counted as new.
+
+    After lftp exits, one last check catches renames since the previous poll.
+    On a clean exit the local tree is a complete mirror, so anything still
+    pending is recorded as downloaded if it exists, or dropped if it doesn't
+    (the source file went away).
     """
-    active = {}  # path -> {"started", "temp_seen", "size"}; insertion-ordered
+    active = pending
     active_lock = threading.Lock()
+    for info in active.values():
+        info["this_cycle"] = False
     downloaded = 0
     removed = 0
 
@@ -199,16 +234,31 @@ def run_lftp(command):
             if transfer_match:
                 path = transfer_match.group(1)
                 with active_lock:
-                    if path in active:
+                    info = active.get(path)
+                    if info is not None and info["this_cycle"]:
                         continue
-                    active[path] = {"started": time.time(), "temp_seen": False, "size": -1}
-                logging.info(f"  🟢 Downloading: {path}")
-                web.record_event("start", path)
+                    resumed = info is not None
+                    if resumed:
+                        info["this_cycle"] = True
+                    else:
+                        active[path] = {"started": time.time(), "temp_seen": False,
+                                        "size": -1, "this_cycle": True}
+                if resumed:
+                    logging.info(f"  🔁 Resuming:    {path}")
+                else:
+                    logging.info(f"  🟢 Downloading: {path}")
+                web.record_event("start", path, resumed=resumed)
                 web.add_active(path)
             elif remove_match:
+                path = remove_match.group(1)
+                if is_lftp_temp(path):
+                    # Shouldn't happen with the --exclude-glob, but never
+                    # report lftp's own partial files as content removals.
+                    logging.debug(f"lftp removed temp file: {path}")
+                    continue
                 removed += 1
-                logging.info(f"  🗑️  Removing:   {remove_match.group(1)}")
-                web.record_event("remove", remove_match.group(1))
+                logging.info(f"  🗑️  Removing:   {path}")
+                web.record_event("remove", path)
             elif mkdir_match:
                 logging.info(f"  📁 mkdir:      {mkdir_match.group(1)}")
             else:
@@ -293,13 +343,22 @@ def run_lftp(command):
         for t in threads:
             t.join()
 
+        # Catch renames that landed after the last poll, including ones just
+        # before lftp exited with an error.
+        check_active()
+
         if process.returncode == 0:
-            # Catch anything the poller hadn't confirmed yet (e.g. finished
-            # in the last poll interval, or temp files disabled).
             for path in list(active):
-                mark_downloaded(path)
+                final = os.path.join(TARGET_DIR, path)
+                if os.path.exists(final) and not os.path.exists(final + LFTP_TEMP_SUFFIX):
+                    mark_downloaded(path)
+                else:
+                    logging.debug(f"Dropping {path}: no longer on the source")
+                    with active_lock:
+                        active.pop(path, None)
+            remove_orphan_temp_files()
         elif active:
-            logging.warning(f"{len(active)} in-flight transfer(s) not completed; will resume next cycle")
+            logging.warning(f"{len(active)} transfer(s) not completed; will resume next cycle")
     finally:
         # Never leave stale entries in /status "active", whether lftp
         # succeeded, failed, was stall-killed, or run_lftp itself raised.
@@ -354,7 +413,10 @@ def main():
     logging.info(f"🚫 Excludes: {', '.join(d for d in exclude_dirs if d)}")
 
     # Construct the lftp command
-    lftp_command = f"/usr/bin/lftp -u {SSH_USERNAME},{SSH_PASSWORD} -e \"mirror --continue --verbose --delete --parallel=5 --use-pget-n=5 {exclude_string} {SOURCE_DIR} {TARGET_DIR}; quit\" sftp://{SOURCE_HOSTNAME}:{SSH_PORT}"
+    # lftp's own temp files are excluded so --delete leaves partial
+    # downloads alone (excluded files are never deleted locally).
+    temp_excludes = " ".join(f"--exclude-glob '{g}'" for g in LFTP_TEMP_GLOBS)
+    lftp_command = f"/usr/bin/lftp -u {SSH_USERNAME},{SSH_PASSWORD} -e \"mirror --continue --verbose --delete --parallel=5 --use-pget-n=5 {temp_excludes} {exclude_string} {SOURCE_DIR} {TARGET_DIR}; quit\" sftp://{SOURCE_HOSTNAME}:{SSH_PORT}"
     # FIX: Pass lftp_command as a list to eliminate shell=True
     # lftp_command = [
     #     '/usr/bin/lftp', '-u', f'{SSH_USERNAME},{SSH_PASSWORD}',
@@ -362,6 +424,8 @@ def main():
     #     f'sftp://{SOURCE_HOSTNAME}:{SSH_PORT}'
     # ]
 
+    # Started-but-unconfirmed transfers, kept across cycles (see run_lftp).
+    pending = {}
     cycle = 0
     while True:
         cycle += 1
@@ -372,7 +436,7 @@ def main():
 
         # Run the command
         try:
-            returncode, downloaded, removed = run_lftp(lftp_command)
+            returncode, downloaded, removed = run_lftp(lftp_command, pending)
             if returncode != 0:
                 logging.error(f"lftp failed with exit code {returncode}")
                 web.update_state(last_error=f"lftp exited with code {returncode}")

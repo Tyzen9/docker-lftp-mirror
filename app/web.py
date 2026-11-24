@@ -3,7 +3,8 @@ consumers (e.g. a Home Assistant RESTful sensor) without adding a dependency.
 
 Endpoints:
   GET /status - current cycle summary plus in-flight transfers (JSON)
-  GET /events - recent start/download/remove history, newest first (JSON)
+  GET /events - recent start/download/remove history, newest first (JSON);
+                optional ?limit=, ?event= and ?subfolder= filters
 """
 import json
 import logging
@@ -109,34 +110,54 @@ def get_state():
         return json.loads(json.dumps(_state))
 
 
-def record_event(event, path):
-    """Append a start/download/remove event to the history log and bump its total."""
+def record_event(event, path, resumed=False):
+    """Append a start/download/remove event to the history log and bump its
+    total. A resumed start (a transfer carried over from an earlier, failed
+    cycle) is flagged and not counted again in totals.start."""
     entry = {
         "time": datetime.now(TZ).isoformat(timespec="seconds"),
         "event": event,
         "subfolder": _subfolder(path),
         "path": path,
     }
+    if resumed:
+        entry["resumed"] = True
     _history_logger.info(json.dumps(entry))
+    if resumed:
+        return
     with _lock:
         _state["totals"][event] = _state["totals"].get(event, 0) + 1
 
 
-def _tail_events(limit):
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    with open(HISTORY_FILE, "r") as f:
-        lines = f.readlines()[-limit:]
+def _history_files():
+    """The live history file followed by its rotated backups, newest first."""
+    files = [HISTORY_FILE]
+    files += [f"{HISTORY_FILE}.{i}" for i in range(1, HISTORY_BACKUP_COUNT + 1)]
+    return [f for f in files if os.path.exists(f)]
+
+
+def _tail_events(limit, event=None, subfolder=None):
+    """Newest-first events matching the filters, reading back through rotated
+    history files until `limit` matches are found."""
     events = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    events.reverse()
+    for path in _history_files():
+        with open(path, "r") as f:
+            lines = f.readlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event is not None and entry.get("event") != event:
+                continue
+            if subfolder is not None and entry.get("subfolder") != subfolder:
+                continue
+            events.append(entry)
+            if len(events) >= limit:
+                return events
     return events
 
 
@@ -163,7 +184,9 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 50
             limit = max(1, min(limit, EVENTS_MAX_LIMIT))
-            self._send_json({"events": _tail_events(limit)})
+            event = qs.get("event", [None])[0] or None
+            subfolder = qs.get("subfolder", [None])[0]
+            self._send_json({"events": _tail_events(limit, event, subfolder)})
         else:
             self._send_json({"error": "not found"}, status=404)
 

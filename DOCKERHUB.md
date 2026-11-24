@@ -1,6 +1,6 @@
 # Tyzen9 - docker-lftp-mirror
 
-GitHub Repo: https://github.com/Tyzen9/docker-lftp-mirror
+**GitHub Repo:** [github.com/Tyzen9/docker-lftp-mirror](https://github.com/Tyzen9/docker-lftp-mirror)
 
 This container is excellent for mirroring the contents of a source server to a target server using an `ssh` tunnel and `lftp` to perform efficient file transfers through a secure connection.
 
@@ -84,7 +84,7 @@ The container runs a small built-in HTTP server (no extra dependencies) for inte
 | Endpoint | Description |
 | :--- | :--- |
 | `GET /status` | Current cycle summary: last/next sync times, download/removed counts, success state, any error, and the files currently being copied (`active`) |
-| `GET /events?limit=50` | Most recent start/download/remove events (newest first, max 1000), sourced from the rotating `HISTORY_FILE` JSON-lines log |
+| `GET /events?limit=50` | Most recent start/download/remove events (newest first), sourced from the rotating `HISTORY_FILE` JSON-lines log. See [Events](#events) for filters |
 
 Example `/status` response:
 ```json
@@ -111,6 +111,7 @@ lftp writes each file under a temporary `<name>.lftp` name and renames it once t
 - `active` lists the files being copied right now. `bytes` is how much of the file has landed locally so far. The total size isn't known, so there's no percentage. With `--use-pget-n=5` each file arrives in 5 chunks, so `bytes` grows unevenly.
 - A file leaves `active` and gets a `download` event as soon as it's renamed into place, not when the whole sync cycle ends.
 - `downloaded` is the number of files completed in the last cycle, including files that finished before a cycle failed.
+- lftp's temp files (`*.lftp`, `*.lftp-pget-status`) are excluded from the mirror, so `--delete` never removes a partial download and they never show up as `remove` events. Temp files orphaned by a transfer that can never finish (the source file was deleted mid-copy) are cleaned up after the next successful sync.
 
 ### Events
 | Event | Meaning |
@@ -119,7 +120,23 @@ lftp writes each file under a temporary `<name>.lftp` name and renames it once t
 | `download` | The file is complete and in its final location |
 | `remove` | The file or directory was deleted locally because it no longer exists on the source (`--delete`) |
 
-If a cycle fails or is killed by the stall watchdog, files still in flight get no `download` event and are dropped from `active`. The next cycle resumes them (`--continue`) and records them as `start` again, so `totals.start` can be higher than `totals.download`.
+Every completed file gets exactly one `download` event, even when its sync cycle fails or is killed by the stall watchdog:
+
+- A file renamed into place just before lftp exits is still caught by a final check after lftp exits.
+- A file still in flight when a cycle fails drops out of `active` but stays tracked. When the next cycle resumes it (`--continue`), it gets a `start` event with `"resumed": true`, which `totals.start` doesn't count again, and then its `download` event when it finishes.
+- If a pending file is never resumed (for example, the source file was removed), it's dropped without a `download` event after the next successful sync.
+
+Pending transfers are tracked in memory, so a transfer interrupted by a container restart is recorded as a new `start` when it picks up again.
+
+`/events` query parameters:
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `limit` | 50 | Number of events to return (1-1000) |
+| `event` | all | Only return `start`, `download` or `remove` events |
+| `subfolder` | all | Only return events for one top-level folder, e.g. `radarr` |
+
+Filters are applied before `limit`, and reading continues back through the rotated history files, so `/events?event=download&subfolder=radarr&limit=20` returns the last 20 movie arrivals even when other folders are busier.
 
 Event timestamps are rendered in the zone configured by `TZ_ID` (falling back to UTC if unset or not a recognized [IANA zone name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List)). History is recorded even when `DISABLE_WEB_API` is set.
 
@@ -129,7 +146,8 @@ Example `/events` response:
   "events": [
     {"time": "2026-08-05T10:04:41-04:00", "event": "download", "subfolder": "movies", "path": "movies/example.mkv"},
     {"time": "2026-08-05T10:00:05-04:00", "event": "remove", "subfolder": "temp", "path": "temp/old.txt"},
-    {"time": "2026-08-05T10:00:03-04:00", "event": "start", "subfolder": "movies", "path": "movies/example.mkv"}
+    {"time": "2026-08-05T10:00:03-04:00", "event": "start", "subfolder": "movies", "path": "movies/example.mkv", "resumed": true},
+    {"time": "2026-08-05T09:52:10-04:00", "event": "start", "subfolder": "movies", "path": "movies/example.mkv"}
   ]
 }
 ```
